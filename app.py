@@ -1,10 +1,3 @@
-Ah, I see! In the JSON workflow you provided, the node's actual title is `Load Latent Upscale Model` but its internal ComfyUI type is registered under the ID `"LatentUpscaleModelLoader"`. 
-
-I've updated the script to strictly load the `Load Latent Upscale Model` node via its proper mapping key `"LatentUpscaleModelLoader"`. 
-
-Here is the fully corrected `app.py` code:
-
-```python
 import os
 import random
 import time
@@ -426,4 +419,3 @@ with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
 # ============================================================
 
 demo.launch(share=True, debug=True)
-```
