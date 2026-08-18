@@ -1,4 +1,5 @@
 import os
+import random
 import time
 import shutil
 import re
@@ -28,7 +29,7 @@ print("=" * 60)
 UNETLoader = NODE_CLASS_MAPPINGS["UNETLoader"]()
 CLIPLoader = NODE_CLASS_MAPPINGS["CLIPLoader"]()
 VAELoader = NODE_CLASS_MAPPINGS["VAELoader"]()
-LatentUpscaleModelLoader = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
+UpscaleModelLoader = NODE_CLASS_MAPPINGS["UpscaleModelLoader"]()
 LoraLoader = NODE_CLASS_MAPPINGS["LoraLoader"]()
 
 # Conditioning & Latent
@@ -91,7 +92,7 @@ with torch.inference_mode():
 
     print("[5/5] Loading Latent Upscaler... ", end="", flush=True)
     t0 = time.time()
-    upscale_model = LatentUpscaleModelLoader.load_model(
+    upscale_model = UpscaleModelLoader.load_model(
         "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
     )[0]
     print(f"done ({time.time() - t0:.1f}s)")
