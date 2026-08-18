@@ -1,3 +1,10 @@
+Ah, I see! In the JSON workflow you provided, the node's actual title is `Load Latent Upscale Model` but its internal ComfyUI type is registered under the ID `"LatentUpscaleModelLoader"`. 
+
+I've updated the script to strictly load the `Load Latent Upscale Model` node via its proper mapping key `"LatentUpscaleModelLoader"`. 
+
+Here is the fully corrected `app.py` code:
+
+```python
 import os
 import random
 import time
@@ -30,15 +37,8 @@ UNETLoader = NODE_CLASS_MAPPINGS["UNETLoader"]()
 CLIPLoader = NODE_CLASS_MAPPINGS["CLIPLoader"]()
 VAELoader = NODE_CLASS_MAPPINGS["VAELoader"]()
 
-# Fix for dynamic UpscaleModelLoader naming in ComfyUI
-UpscaleModelLoader = None
-for name, cls in NODE_CLASS_MAPPINGS.items():
-    if name == "UpscaleModelLoader" or name == "LatentUpscaleModelLoader":
-        UpscaleModelLoader = cls()
-        break
-
-if UpscaleModelLoader is None:
-    raise ValueError("Could not find UpscaleModelLoader in ComfyUI mappings")
+# Use 'LatentUpscaleModelLoader' which corresponds to the "Load Latent Upscale Model" node in the workflow
+LatentUpscaleModelLoader = NODE_CLASS_MAPPINGS["LatentUpscaleModelLoader"]()
 
 LoraLoader = NODE_CLASS_MAPPINGS["LoraLoader"]()
 
@@ -102,7 +102,7 @@ with torch.inference_mode():
 
     print("[5/5] Loading Latent Upscaler... ", end="", flush=True)
     t0 = time.time()
-    upscale_model = UpscaleModelLoader.load_model(
+    upscale_model = LatentUpscaleModelLoader.load_model(
         "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
     )[0]
     print(f"done ({time.time() - t0:.1f}s)")
@@ -426,3 +426,4 @@ with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
 # ============================================================
 
 demo.launch(share=True, debug=True)
+```
