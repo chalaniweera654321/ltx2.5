@@ -414,8 +414,4 @@ with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
         outputs=[output_vid, download_video, used_seed]
     )
 
-# ============================================================
-# LAUNCH
-# ============================================================
-
 demo.launch(share=True, debug=True)
