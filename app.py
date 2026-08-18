@@ -1,716 +1,985 @@
+# ============================================================
+# LTX-2.5 DIRECT COMFYUI NODE APP
+#
+# Same architecture as the user's working Krea-2 app:
+#
+#     Gradio
+#        ↓
+# NODE_CLASS_MAPPINGS
+#        ↓
+# LTX-2.5 subgraph
+#        ↓
+# Video
+#
+# NO ComfyUI HTTP SERVER
+# NO port 8188
+# NO WebSocket
+# NO LoRAs
+# ============================================================
+
 import os
-import json
-import uuid
+import sys
 import time
 import random
-import requests
-import websocket
+import inspect
+import traceback
+from pathlib import Path
+
+import torch
 import gradio as gr
 
+from nodes import NODE_CLASS_MAPPINGS
+
 
 # ============================================================
-# LTX-2.5 COMFYUI VIDEO APP
-# No LoRAs
+# SETTINGS
 # ============================================================
 
-COMFYUI_URL = "http://127.0.0.1:8188"
+APP_TITLE = "LTX-2.5 Video Generator"
 
-CLIENT_ID = str(uuid.uuid4())
-
-# ------------------------------------------------------------
-# Default settings from the supplied workflow
-# ------------------------------------------------------------
-
-DEFAULT_NEGATIVE = (
-    "blurry, low quality, still frame, frames, watermark, "
-    "overlay, titles, has blurbox, has subtitles"
+COMFYUI_ROOT = Path(
+    os.environ.get(
+        "COMFYUI_ROOT",
+        "/root/ComfyUI"
+    )
 )
 
-DEFAULT_WIDTH = 1280
-DEFAULT_HEIGHT = 720
-DEFAULT_FPS = 24
-DEFAULT_DURATION = 5
+OUTPUT_DIR = COMFYUI_ROOT / "output"
 
-# The supplied workflow uses 105 frames at 25 FPS in one section,
-# but the LTX-2.5 workflow description exposes duration/FPS.
-# We calculate frames from duration and FPS.
-def duration_to_frames(duration, fps):
-    frames = int(round(float(duration) * int(fps)))
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
 
-    # LTX video frame counts work best when represented as
-    # 8n + 1.
-    frames = max(9, frames)
 
-    remainder = (frames - 1) % 8
+# ============================================================
+# MODEL NAMES FROM THE EXACT WORKFLOW
+# ============================================================
+
+LTX_MODEL = (
+    "ltx-2.5-22b-distilled-transformer-"
+    "comfy-int8-convrot.safetensors"
+)
+
+VIDEO_VAE = (
+    "ltx-2.5-video-vae-bf16.safetensors"
+)
+
+AUDIO_VAE = (
+    "ltx-2.5-audio-vae-bf16.safetensors"
+)
+
+UPSCALE_MODEL = (
+    "ltx-2.5-latent-spatial-upscaler-x2-"
+    "bf16-1.0.safetensors"
+)
+
+PROMPT_ENHANCE_MODEL = (
+    "gemma4-12b-with-proj-ltx-2.5-"
+    "comfy-int8-convrot.safetensors"
+)
+
+
+DEFAULT_NEGATIVE = (
+    "blurry, low quality, still frame, frames, "
+    "watermark, overlay, titles, has blurbox, "
+    "has subtitles"
+)
+
+
+# ============================================================
+# FIND THE LTX-2.5 SUBGRAPH
+# ============================================================
+
+def find_ltx25_node():
+
+    print("\n" + "=" * 60)
+    print("Searching for LTX-2.5 ComfyUI node...")
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # The workflow supplied by the user contains this UUID as
+    # the subgraph type.
+    # --------------------------------------------------------
+
+    known_uuid = (
+        "8b4f085c-1bb3-4ecd-aeed-603a8d6d3970"
+    )
+
+    if known_uuid in NODE_CLASS_MAPPINGS:
+
+        cls = NODE_CLASS_MAPPINGS[
+            known_uuid
+        ]
+
+        print(
+            f"✓ Found LTX-2.5 subgraph: {known_uuid}"
+        )
+
+        return cls
+
+    # --------------------------------------------------------
+    # Try to find it by its input signature.
+    #
+    # This makes the app more tolerant of ComfyUI versions
+    # that register the subgraph under a different internal key.
+    # --------------------------------------------------------
+
+    wanted = {
+        "text",
+        "value",
+        "value_1",
+        "value_2",
+        "value_3",
+        "noise_seed",
+        "value_4",
+        "vae_name",
+        "vae_name_1",
+        "model_name",
+        "clip_name_1",
+    }
+
+    candidates = []
+
+    for key, cls in NODE_CLASS_MAPPINGS.items():
+
+        try:
+
+            if not hasattr(
+                cls,
+                "INPUT_TYPES"
+            ):
+                continue
+
+            info = cls.INPUT_TYPES()
+
+            required = info.get(
+                "required",
+                {}
+            )
+
+            optional = info.get(
+                "optional",
+                {}
+            )
+
+            names = (
+                set(required.keys())
+                |
+                set(optional.keys())
+            )
+
+            score = len(
+                wanted.intersection(names)
+            )
+
+            if score >= 6:
+
+                candidates.append(
+                    (
+                        score,
+                        key,
+                        cls,
+                        names
+                    )
+                )
+
+        except Exception:
+            continue
+
+    candidates.sort(
+        reverse=True,
+        key=lambda x: x[0]
+    )
+
+    if candidates:
+
+        score, key, cls, names = candidates[0]
+
+        print(
+            f"✓ Found probable LTX-2.5 node: {key}"
+        )
+
+        print(
+            f"  Signature score: {score}"
+        )
+
+        return cls
+
+    # --------------------------------------------------------
+    # Print useful diagnostics
+    # --------------------------------------------------------
+
+    print(
+        "\n❌ Could not find the LTX-2.5 subgraph."
+    )
+
+    print(
+        "\nAvailable LTX-related nodes:"
+    )
+
+    for key in NODE_CLASS_MAPPINGS:
+
+        name = str(key).lower()
+
+        if "ltx" in name:
+
+            print(
+                " ",
+                key
+            )
+
+    raise RuntimeError(
+        "LTX-2.5 ComfyUI node was not found.\n\n"
+        "Make sure your ComfyUI version contains "
+        "the LTX-2.5 workflow nodes."
+    )
+
+
+LTX25_NODE_CLASS = find_ltx25_node()
+
+
+# ============================================================
+# DISPLAY NODE INPUTS
+# ============================================================
+
+try:
+
+    LTX_INPUT_TYPES = (
+        LTX25_NODE_CLASS.INPUT_TYPES()
+    )
+
+    print(
+        "\nLTX-2.5 node inputs:"
+    )
+
+    for section in (
+        "required",
+        "optional"
+    ):
+
+        for name in LTX_INPUT_TYPES.get(
+            section,
+            {}
+        ):
+
+            print(
+                f"  {name}"
+            )
+
+except Exception as e:
+
+    print(
+        "Could not inspect LTX node:",
+        e
+    )
+
+
+# ============================================================
+# NODE INSTANCE
+# ============================================================
+
+print(
+    "\nInitializing LTX-2.5 node..."
+)
+
+LTX25_NODE = LTX25_NODE_CLASS()
+
+
+print(
+    "✓ LTX-2.5 node initialized"
+)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_function_name(node):
+
+    function_name = getattr(
+        node,
+        "FUNCTION",
+        None
+    )
+
+    if function_name:
+        return function_name
+
+    # Fallbacks used by various ComfyUI nodes
+    for name in (
+        "execute",
+        "generate",
+        "run",
+        "process",
+    ):
+
+        if hasattr(
+            node,
+            name
+        ):
+
+            return name
+
+    raise RuntimeError(
+        "Could not determine the LTX-2.5 "
+        "node execution function."
+    )
+
+
+def get_callable_inputs(node):
+
+    function_name = get_function_name(
+        node
+    )
+
+    function = getattr(
+        node,
+        function_name
+    )
+
+    try:
+
+        signature = inspect.signature(
+            function
+        )
+
+        return signature
+
+    except Exception:
+
+        return None
+
+
+def make_frame_count(
+    duration,
+    fps
+):
+
+    # LTX video latent length follows the
+    # 8n + 1 pattern.
+
+    frames = int(
+        round(
+            float(duration)
+            * int(fps)
+        )
+    )
+
+    frames = max(
+        9,
+        frames
+    )
+
+    remainder = (
+        frames - 1
+    ) % 8
+
     if remainder:
-        frames += 8 - remainder
+
+        frames += (
+            8 - remainder
+        )
 
     return frames
 
 
 # ============================================================
-# WORKFLOW
+# EXECUTE LTX SUBGRAPH
 # ============================================================
 
-def build_workflow(
+def execute_ltx25(
     prompt,
-    negative_prompt,
+    prompt_enhance,
+    duration,
     width,
     height,
-    duration,
-    fps,
     seed,
-    prompt_enhance,
+    fps
 ):
-    frames = duration_to_frames(duration, fps)
 
-    # --------------------------------------------------------
-    # This is based on the supplied LTX workflow.
-    #
-    # IMPORTANT:
-    # The exact node names/inputs can differ depending on the
-    # installed ComfyUI/LTX version.
-    # --------------------------------------------------------
-
-    workflow = {
-        "1": {
-            "inputs": {
-                "ckpt_name":
-                    "ltx-av-step-1751000_vocoder_24K.safetensors"
-            },
-            "class_type": "CheckpointLoaderSimple"
-        },
-
-        "2": {
-            "inputs": {
-                "gemma_path":
-                    "gemma-3-12b-it-qat-q4_0-unquantized_readout_proj/model/model.safetensors",
-                "ltxv_path":
-                    "ltx-av-step-1751000_vocoder_24K.safetensors",
-                "max_length": 1024
-            },
-            "class_type": "LTXVGemmaCLIPModelLoader"
-        },
-
-        # ----------------------------------------------------
-        # POSITIVE PROMPT
-        # ----------------------------------------------------
-
-        "3": {
-            "inputs": {
-                "text": prompt,
-                "clip": [
-                    "2",
-                    0
-                ]
-            },
-            "class_type": "CLIPTextEncode"
-        },
-
-        # ----------------------------------------------------
-        # NEGATIVE PROMPT
-        # ----------------------------------------------------
-
-        "4": {
-            "inputs": {
-                "text": negative_prompt,
-                "clip": [
-                    "2",
-                    0
-                ]
-            },
-            "class_type": "CLIPTextEncode"
-        },
-
-        # ----------------------------------------------------
-        # SAMPLER
-        # ----------------------------------------------------
-
-        "8": {
-            "inputs": {
-                "sampler_name": "euler"
-            },
-            "class_type": "KSamplerSelect"
-        },
-
-        # ----------------------------------------------------
-        # SCHEDULER
-        # ----------------------------------------------------
-
-        "9": {
-            "inputs": {
-                "steps": 20,
-                "max_shift": 2.05,
-                "base_shift": 0.95,
-                "stretch": True,
-                "terminal": 0.1,
-                "latent": [
-                    "28",
-                    0
-                ]
-            },
-            "class_type": "LTXVScheduler"
-        },
-
-        # ----------------------------------------------------
-        # RANDOM NOISE
-        # ----------------------------------------------------
-
-        "11": {
-            "inputs": {
-                "noise_seed": int(seed)
-            },
-            "class_type": "RandomNoise"
-        },
-
-        # ----------------------------------------------------
-        # VIDEO VAE
-        # ----------------------------------------------------
-
-        "12": {
-            "inputs": {
-                "samples": [
-                    "29",
-                    0
-                ],
-                "vae": [
-                    "1",
-                    2
-                ]
-            },
-            "class_type": "VAEDecode"
-        },
-
-        # ----------------------------------------------------
-        # AUDIO VAE
-        # ----------------------------------------------------
-
-        "13": {
-            "inputs": {
-                "ckpt_name":
-                    "ltx-av-step-1751000_vocoder_24K.safetensors"
-            },
-            "class_type": "LTXVAudioVAELoader"
-        },
-
-        "14": {
-            "inputs": {
-                "samples": [
-                    "29",
-                    1
-                ],
-                "audio_vae": [
-                    "13",
-                    0
-                ]
-            },
-            "class_type": "LTXVAudioVAEDecode"
-        },
-
-        # ----------------------------------------------------
-        # VIDEO OUTPUT
-        # ----------------------------------------------------
-
-        "15": {
-            "inputs": {
-                "frame_rate": [
-                    "23",
-                    0
-                ],
-                "loop_count": 0,
-                "filename_prefix": "LTX2_5",
-                "format": "video/h264-mp4",
-                "pix_fmt": "yuv420p",
-                "crf": 19,
-                "save_metadata": True,
-                "trim_to_audio": False,
-                "pingpong": False,
-                "save_output": True,
-                "images": [
-                    "12",
-                    0
-                ],
-                "audio": [
-                    "14",
-                    0
-                ]
-            },
-            "class_type": "VHS_VideoCombine"
-        },
-
-        # ----------------------------------------------------
-        # MULTIMODAL GUIDER
-        # ----------------------------------------------------
-
-        "17": {
-            "inputs": {
-                "skip_blocks": "29",
-                "model": [
-                    "28",
-                    1
-                ],
-                "positive": [
-                    "22",
-                    0
-                ],
-                "negative": [
-                    "22",
-                    1
-                ],
-                "parameters": [
-                    "18",
-                    0
-                ]
-            },
-            "class_type": "MultimodalGuider"
-        },
-
-        # ----------------------------------------------------
-        # VIDEO GUIDER PARAMETERS
-        # ----------------------------------------------------
-
-        "18": {
-            "inputs": {
-                "modality": "VIDEO",
-                "cfg": 3,
-                "stg": 0,
-                "rescale": 0,
-                "modality_scale": 3,
-                "parameters": [
-                    "19",
-                    0
-                ]
-            },
-            "class_type": "GuiderParameters"
-        },
-
-        # ----------------------------------------------------
-        # AUDIO GUIDER PARAMETERS
-        # ----------------------------------------------------
-
-        "19": {
-            "inputs": {
-                "modality": "AUDIO",
-                "cfg": 7,
-                "stg": 0,
-                "rescale": 0,
-                "modality_scale": 3
-            },
-            "class_type": "GuiderParameters"
-        },
-
-        # ----------------------------------------------------
-        # FRAME RATE
-        # ----------------------------------------------------
-
-        "23": {
-            "inputs": {
-                "value": float(fps)
-            },
-            "class_type": "FloatConstant"
-        },
-
-        "42": {
-            "inputs": {
-                "a": [
-                    "23",
-                    0
-                ]
-            },
-            "class_type": "CM_FloatToInt"
-        },
-
-        # ----------------------------------------------------
-        # AUDIO LATENT
-        # ----------------------------------------------------
-
-        "26": {
-            "inputs": {
-                "frames_number": [
-                    "27",
-                    0
-                ],
-                "frame_rate": [
-                    "42",
-                    0
-                ],
-                "batch_size": 1
-            },
-            "class_type": "LTXVEmptyLatentAudio"
-        },
-
-        "27": {
-            "inputs": {
-                "value": frames
-            },
-            "class_type": "INTConstant"
-        },
-
-        # ----------------------------------------------------
-        # VIDEO LATENT
-        # ----------------------------------------------------
-
-        "43": {
-            "inputs": {
-                "width": int(width),
-                "height": int(height),
-                "length": [
-                    "27",
-                    0
-                ],
-                "batch_size": 1
-            },
-            "class_type": "EmptyLTXVLatentVideo"
-        },
-
-        # ----------------------------------------------------
-        # CONCAT VIDEO + AUDIO
-        # ----------------------------------------------------
-
-        "28": {
-            "inputs": {
-                "video_latent": [
-                    "43",
-                    0
-                ],
-                "audio_latent": [
-                    "26",
-                    0
-                ],
-                "model": [
-                    "44",
-                    0
-                ]
-            },
-            "class_type": "LTXVConcatAVLatent"
-        },
-
-        # ----------------------------------------------------
-        # SEPARATE VIDEO + AUDIO
-        # ----------------------------------------------------
-
-        "29": {
-            "inputs": {
-                "av_latent": [
-                    "41",
-                    0
-                ],
-                "model": [
-                    "28",
-                    1
-                ]
-            },
-            "class_type": "LTXVSeparateAVLatent"
-        },
-
-        # ----------------------------------------------------
-        # SAMPLER
-        # ----------------------------------------------------
-
-        "41": {
-            "inputs": {
-                "noise": [
-                    "11",
-                    0
-                ],
-                "guider": [
-                    "17",
-                    0
-                ],
-                "sampler": [
-                    "8",
-                    0
-                ],
-                "sigmas": [
-                    "9",
-                    0
-                ],
-                "latent_image": [
-                    "28",
-                    0
-                ]
-            },
-            "class_type": "SamplerCustomAdvanced"
-        },
-
-        # ----------------------------------------------------
-        # MODEL PATCHER
-        # ----------------------------------------------------
-
-        "44": {
-            "inputs": {
-                "torch_compile": True,
-                "disable_backup": False,
-                "model": [
-                    "1",
-                    0
-                ]
-            },
-            "class_type": "LTXVSequenceParallelMultiGPUPatcher"
-        },
-
-        # ----------------------------------------------------
-        # CONDITIONING
-        # ----------------------------------------------------
-
-        "22": {
-            "inputs": {
-                "frame_rate": [
-                    "23",
-                    0
-                ],
-                "positive": [
-                    "3",
-                    0
-                ],
-                "negative": [
-                    "4",
-                    0
-                ]
-            },
-            "class_type": "LTXVConditioning"
-        }
-    }
-
-    # --------------------------------------------------------
-    # Prompt enhancer
-    #
-    # The supplied workflow exposes prompt enhancement at the
-    # high-level LTX-2.5 node. If your installed LTX nodes expose
-    # a specific enhancer node, this can be connected there.
-    # --------------------------------------------------------
-
-    return workflow
-
-
-# ============================================================
-# COMFYUI API
-# ============================================================
-
-def queue_prompt(workflow):
-
-    payload = {
-        "prompt": workflow,
-        "client_id": CLIENT_ID
-    }
-
-    response = requests.post(
-        COMFYUI_URL + "/prompt",
-        json=payload,
-        timeout=30
+    duration = int(
+        duration
     )
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    if "error" in data:
-        raise RuntimeError(
-            json.dumps(data, indent=2)
-        )
-
-    return data["prompt_id"]
-
-
-def get_history(prompt_id):
-
-    response = requests.get(
-        COMFYUI_URL + f"/history/{prompt_id}",
-        timeout=30
+    width = int(
+        width
     )
 
-    response.raise_for_status()
-
-    return response.json()
-
-
-def wait_for_generation(prompt_id):
-
-    ws_url = (
-        COMFYUI_URL
-        .replace("http://", "ws://")
-        .replace("https://", "wss://")
-        + f"/ws?clientId={CLIENT_ID}"
+    height = int(
+        height
     )
 
-    ws = websocket.create_connection(
-        ws_url,
-        timeout=5
+    fps = int(
+        fps
     )
 
-    try:
+    seed = int(
+        seed
+    )
 
-        while True:
+    # --------------------------------------------------------
+    # LTX resolution
+    # --------------------------------------------------------
 
-            try:
-                message = ws.recv()
+    width = max(
+        32,
+        (width // 32) * 32
+    )
 
-            except websocket.WebSocketTimeoutException:
+    height = max(
+        32,
+        (height // 32) * 32
+    )
 
-                history = get_history(prompt_id)
+    # --------------------------------------------------------
+    # LTX frame count
+    # --------------------------------------------------------
 
-                if prompt_id in history:
+    frames = make_frame_count(
+        duration,
+        fps
+    )
 
-                    return history[prompt_id]
+    print(
+        "\n" + "=" * 60
+    )
 
-                continue
+    print(
+        "LTX-2.5 GENERATION"
+    )
 
-            if not message:
-                continue
+    print(
+        "=" * 60
+    )
 
-            if isinstance(message, bytes):
-                continue
+    print(
+        f"Prompt: {prompt}"
+    )
 
-            data = json.loads(message)
+    print(
+        f"Prompt Enhance: {prompt_enhance}"
+    )
 
-            msg_type = data.get("type")
+    print(
+        f"Duration: {duration}s"
+    )
 
-            msg_data = data.get("data", {})
+    print(
+        f"Resolution: {width}x{height}"
+    )
 
-            if msg_type == "executing":
+    print(
+        f"FPS: {fps}"
+    )
 
-                current_prompt = msg_data.get(
-                    "prompt_id"
-                )
+    print(
+        f"Frames: {frames}"
+    )
 
-                node = msg_data.get("node")
+    print(
+        f"Seed: {seed}"
+    )
 
-                if current_prompt == prompt_id:
+    # --------------------------------------------------------
+    # Inspect actual node signature
+    # --------------------------------------------------------
 
-                    if node is None:
+    input_types = (
+        LTX25_NODE_CLASS.INPUT_TYPES()
+    )
 
-                        time.sleep(1)
-
-                        history = get_history(
-                            prompt_id
-                        )
-
-                        if prompt_id in history:
-                            return history[prompt_id]
-
-            elif msg_type == "execution_error":
-
-                if msg_data.get(
-                    "prompt_id"
-                ) == prompt_id:
-
-                    raise RuntimeError(
-                        json.dumps(
-                            msg_data,
-                            indent=2
-                        )
-                    )
-
-    finally:
-
-        ws.close()
-
-
-# ============================================================
-# FIND GENERATED VIDEO
-# ============================================================
-
-def find_video(history):
-
-    outputs = history.get(
-        "outputs",
+    required = input_types.get(
+        "required",
         {}
     )
 
-    for node_id, node_output in outputs.items():
+    optional = input_types.get(
+        "optional",
+        {}
+    )
 
-        # VHS_VideoCombine normally exposes files
-        # through this structure.
+    available = (
+        set(required.keys())
+        |
+        set(optional.keys())
+    )
 
-        videos = node_output.get(
-            "gifs",
-            []
+    # --------------------------------------------------------
+    # Build exact workflow inputs
+    #
+    # These names correspond to the inputs exposed by the
+    # supplied LTX-2.5 Text-to-Video subgraph.
+    # --------------------------------------------------------
+
+    values = {}
+
+    # Prompt
+    if "text" in available:
+
+        values["text"] = prompt
+
+    elif "prompt" in available:
+
+        values["prompt"] = prompt
+
+    # Prompt enhancer
+    if "value" in available:
+
+        values["value"] = bool(
+            prompt_enhance
         )
 
-        for video in videos:
+    elif "prompt_enhance" in available:
 
-            if video.get("filename"):
+        values["prompt_enhance"] = bool(
+            prompt_enhance
+        )
+
+    # Duration
+    if "value_1" in available:
+
+        values["value_1"] = duration
+
+    elif "duration" in available:
+
+        values["duration"] = duration
+
+    # Width
+    if "value_2" in available:
+
+        values["value_2"] = width
+
+    elif "width" in available:
+
+        values["width"] = width
+
+    # Height
+    if "value_3" in available:
+
+        values["value_3"] = height
+
+    elif "height" in available:
+
+        values["height"] = height
+
+    # Seed
+    if "noise_seed" in available:
+
+        values["noise_seed"] = seed
+
+    elif "seed" in available:
+
+        values["seed"] = seed
+
+    # FPS
+    if "value_4" in available:
+
+        values["value_4"] = fps
+
+    elif "frame_rate" in available:
+
+        values["frame_rate"] = fps
+
+    # Video VAE
+    if "vae_name" in available:
+
+        values["vae_name"] = VIDEO_VAE
+
+    elif "video_vae" in available:
+
+        values["video_vae"] = VIDEO_VAE
+
+    # Audio VAE
+    if "vae_name_1" in available:
+
+        values["vae_name_1"] = AUDIO_VAE
+
+    elif "audio_vae" in available:
+
+        values["audio_vae"] = AUDIO_VAE
+
+    # Spatial latent upscaler
+    if "model_name" in available:
+
+        values["model_name"] = UPSCALE_MODEL
+
+    elif "upscale_model" in available:
+
+        values["upscale_model"] = UPSCALE_MODEL
+
+    # Prompt enhancer model
+    if "clip_name_1" in available:
+
+        values["clip_name_1"] = (
+            PROMPT_ENHANCE_MODEL
+        )
+
+    elif "prompt_enhance_model" in available:
+
+        values[
+            "prompt_enhance_model"
+        ] = PROMPT_ENHANCE_MODEL
+
+    # --------------------------------------------------------
+    # Filter only arguments accepted by the actual function.
+    # --------------------------------------------------------
+
+    signature = get_callable_inputs(
+        LTX25_NODE
+    )
+
+    if signature:
+
+        parameters = signature.parameters
+
+        filtered = {}
+
+        for name, value in values.items():
+
+            if name in parameters:
+
+                filtered[name] = value
+
+        values = filtered
+
+    # --------------------------------------------------------
+    # Show arguments
+    # --------------------------------------------------------
+
+    print(
+        "\nCalling LTX-2.5 node with:"
+    )
+
+    for key, value in values.items():
+
+        print(
+            f"  {key}: {value}"
+        )
+
+    # --------------------------------------------------------
+    # Execute directly
+    # --------------------------------------------------------
+
+    function_name = (
+        get_function_name(
+            LTX25_NODE
+        )
+    )
+
+    function = getattr(
+        LTX25_NODE,
+        function_name
+    )
+
+    print(
+        f"\nExecuting node function: "
+        f"{function_name}"
+    )
+
+    with torch.inference_mode():
+
+        result = function(
+            **values
+        )
+
+    print(
+        "\n✓ LTX-2.5 generation finished"
+    )
+
+    return result
+
+
+# ============================================================
+# EXTRACT VIDEO FROM NODE RESULT
+# ============================================================
+
+def extract_video(result):
+
+    if result is None:
+
+        return None
+
+    # --------------------------------------------------------
+    # ComfyUI nodes normally return tuples.
+    # --------------------------------------------------------
+
+    if isinstance(
+        result,
+        tuple
+    ):
+
+        for item in result:
+
+            video = extract_video(
+                item
+            )
+
+            if video is not None:
 
                 return video
 
-        # Some versions use "videos"
-        videos = node_output.get(
-            "videos",
-            []
-        )
+        return None
 
-        for video in videos:
+    # --------------------------------------------------------
+    # List
+    # --------------------------------------------------------
 
-            if video.get("filename"):
+    if isinstance(
+        result,
+        list
+    ):
+
+        for item in result:
+
+            video = extract_video(
+                item
+            )
+
+            if video is not None:
 
                 return video
+
+        return None
+
+    # --------------------------------------------------------
+    # Dictionary
+    # --------------------------------------------------------
+
+    if isinstance(
+        result,
+        dict
+    ):
+
+        # Direct VIDEO
+        if "video" in result:
+
+            return result[
+                "video"
+            ]
+
+        if "VIDEO" in result:
+
+            return result[
+                "VIDEO"
+            ]
+
+        # Search recursively
+        for value in result.values():
+
+            video = extract_video(
+                value
+            )
+
+            if video is not None:
+
+                return video
+
+        return None
+
+    # --------------------------------------------------------
+    # Object
+    # --------------------------------------------------------
+
+    class_name = (
+        result.__class__.__name__
+    ).lower()
+
+    if (
+        "video" in class_name
+        or "av" in class_name
+    ):
+
+        return result
 
     return None
 
 
 # ============================================================
-# DOWNLOAD VIDEO
+# SAVE VIDEO DIRECTLY THROUGH COMFYUI NODE
 # ============================================================
 
-def download_video(video):
+def save_video_direct(
+    video,
+    seed
+):
 
-    filename = video["filename"]
+    if video is None:
 
-    subfolder = video.get(
-        "subfolder",
-        ""
-    )
-
-    folder_type = video.get(
-        "type",
-        "output"
-    )
-
-    params = {
-        "filename": filename,
-        "subfolder": subfolder,
-        "type": folder_type
-    }
-
-    response = requests.get(
-        COMFYUI_URL + "/view",
-        params=params,
-        timeout=120
-    )
-
-    response.raise_for_status()
-
-    os.makedirs(
-        "outputs",
-        exist_ok=True
-    )
-
-    output_path = os.path.join(
-        "outputs",
-        filename
-    )
-
-    # Avoid accidentally creating nested
-    # directories from subfolder names.
-
-    output_path = os.path.abspath(
-        output_path
-    )
-
-    with open(
-        output_path,
-        "wb"
-    ) as f:
-
-        f.write(
-            response.content
+        raise RuntimeError(
+            "LTX-2.5 returned no VIDEO output."
         )
 
-    return output_path
+    if "SaveVideo" not in (
+        NODE_CLASS_MAPPINGS
+    ):
+
+        raise RuntimeError(
+            "SaveVideo node is not available "
+            "in this ComfyUI installation."
+        )
+
+    SaveVideoClass = (
+        NODE_CLASS_MAPPINGS[
+            "SaveVideo"
+        ]
+    )
+
+    saver = SaveVideoClass()
+
+    function_name = (
+        get_function_name(
+            saver
+        )
+    )
+
+    function = getattr(
+        saver,
+        function_name
+    )
+
+    # --------------------------------------------------------
+    # Inspect SaveVideo's actual API
+    # --------------------------------------------------------
+
+    input_types = (
+        SaveVideoClass.INPUT_TYPES()
+    )
+
+    available = set()
+
+    for section in (
+        "required",
+        "optional"
+    ):
+
+        available.update(
+            input_types.get(
+                section,
+                {}
+            ).keys()
+        )
+
+    values = {}
+
+    if "video" in available:
+
+        values[
+            "video"
+        ] = video
+
+    if "filename_prefix" in available:
+
+        values[
+            "filename_prefix"
+        ] = "LTX2.5/video"
+
+    if "format" in available:
+
+        values[
+            "format"
+        ] = "auto"
+
+    if "codec" in available:
+
+        values[
+            "codec"
+        ] = "auto"
+
+    if "filename_prefix" in available:
+
+        print(
+            "\nSaving video..."
+        )
+
+    signature = get_callable_inputs(
+        saver
+    )
+
+    if signature:
+
+        parameters = signature.parameters
+
+        values = {
+            k: v
+            for k, v in values.items()
+            if k in parameters
+        }
+
+    result = function(
+        **values
+    )
+
+    return result
 
 
 # ============================================================
-# GENERATE
+# FIND NEW MP4
+# ============================================================
+
+def find_new_video(
+    before_files,
+    started_at
+):
+
+    candidates = []
+
+    for path in OUTPUT_DIR.rglob(
+        "*.mp4"
+    ):
+
+        try:
+
+            stat = path.stat()
+
+            if (
+                path not in before_files
+                and stat.st_mtime >= started_at
+            ):
+
+                candidates.append(
+                    path
+                )
+
+        except Exception:
+
+            pass
+
+    if not candidates:
+
+        # Sometimes the saver reuses a filename.
+        for path in OUTPUT_DIR.rglob(
+            "*.mp4"
+        ):
+
+            try:
+
+                if path.stat().st_mtime >= (
+                    started_at - 2
+                ):
+
+                    candidates.append(
+                        path
+                    )
+
+            except Exception:
+
+                pass
+
+    if not candidates:
+
+        return None
+
+    candidates.sort(
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+
+    return candidates[0]
+
+
+# ============================================================
+# GENERATE VIDEO
 # ============================================================
 
 def generate_video(
@@ -724,6 +993,15 @@ def generate_video(
     seed
 ):
 
+    # --------------------------------------------------------
+    # The LTX-2.5 workflow supplied by the user exposes the
+    # negative prompt internally.
+    #
+    # Keep this UI field for compatibility, but do not inject
+    # it into an unrelated node. The exact supplied workflow
+    # uses its own negative-conditioning branch.
+    # --------------------------------------------------------
+
     if not prompt or not prompt.strip():
 
         raise gr.Error(
@@ -732,12 +1010,11 @@ def generate_video(
 
     try:
 
-        width = int(width)
-        height = int(height)
-        fps = int(fps)
-        duration = float(duration)
-
-        if seed is None or int(seed) < 0:
+        # Random seed
+        if (
+            seed is None
+            or int(seed) < 0
+        ):
 
             seed = random.randint(
                 0,
@@ -748,175 +1025,144 @@ def generate_video(
 
             seed = int(seed)
 
-        if width < 64 or height < 64:
+        duration = int(
+            duration
+        )
 
-            raise ValueError(
-                "Width and height must be at least 64."
-            )
+        width = int(
+            width
+        )
 
-        if duration <= 0:
+        height = int(
+            height
+        )
 
-            raise ValueError(
-                "Duration must be greater than 0."
-            )
-
-        if fps <= 0:
-
-            raise ValueError(
-                "FPS must be greater than 0."
-            )
+        fps = int(
+            fps
+        )
 
         # ----------------------------------------------------
-        # Prompt enhancement
+        # Capture existing outputs
         # ----------------------------------------------------
-        #
-        # The supplied LTX-2.5 workflow exposes this as a
-        # workflow-level option.
-        #
-        # We keep the UI option here. The actual enhancer must
-        # be connected to the exact LTX node version installed
-        # in ComfyUI.
-        #
-        final_prompt = prompt.strip()
 
-        workflow = build_workflow(
-            prompt=final_prompt,
-            negative_prompt=(
-                negative_prompt.strip()
-                if negative_prompt
-                else DEFAULT_NEGATIVE
+        before_files = set(
+            OUTPUT_DIR.rglob(
+                "*.mp4"
+            )
+        )
+
+        started_at = time.time()
+
+        # ----------------------------------------------------
+        # Execute exact LTX-2.5 subgraph
+        # ----------------------------------------------------
+
+        result = execute_ltx25(
+            prompt=prompt.strip(),
+            prompt_enhance=bool(
+                prompt_enhance
             ),
+            duration=duration,
             width=width,
             height=height,
-            duration=duration,
-            fps=fps,
             seed=seed,
-            prompt_enhance=prompt_enhance
-        )
-
-        print(
-            "\n========================================"
-        )
-        print(
-            "           LTX-2.5 GENERATION"
-        )
-        print(
-            "========================================"
-        )
-
-        print(
-            f"Prompt: {final_prompt}"
-        )
-
-        print(
-            f"Negative: {negative_prompt}"
-        )
-
-        print(
-            f"Resolution: {width}x{height}"
-        )
-
-        print(
-            f"Duration: {duration}s"
-        )
-
-        print(
-            f"FPS: {fps}"
-        )
-
-        print(
-            f"Seed: {seed}"
-        )
-
-        print(
-            f"Prompt Enhance: {prompt_enhance}"
+            fps=fps
         )
 
         # ----------------------------------------------------
-        # Queue
+        # Try to extract VIDEO
         # ----------------------------------------------------
 
-        print(
-            "\nQueueing workflow..."
-        )
-
-        prompt_id = queue_prompt(
-            workflow
-        )
-
-        print(
-            f"Prompt ID: {prompt_id}"
+        video = extract_video(
+            result
         )
 
         # ----------------------------------------------------
-        # Wait
+        # Save using ComfyUI SaveVideo
         # ----------------------------------------------------
 
-        print(
-            "Waiting for ComfyUI..."
-        )
+        if video is not None:
 
-        history = wait_for_generation(
-            prompt_id
-        )
+            try:
+
+                save_video_direct(
+                    video,
+                    seed
+                )
+
+            except Exception as save_error:
+
+                print(
+                    "\nSaveVideo node warning:"
+                )
+
+                print(
+                    save_error
+                )
 
         # ----------------------------------------------------
-        # Find video
+        # Locate generated MP4
         # ----------------------------------------------------
 
-        video = find_video(
-            history
-        )
+        output_path = None
 
-        if video is None:
+        for _ in range(30):
 
-            raise RuntimeError(
-                "Generation finished, but no video "
-                "was found in the ComfyUI output."
+            output_path = (
+                find_new_video(
+                    before_files,
+                    started_at
+                )
             )
 
-        # ----------------------------------------------------
-        # Download
-        # ----------------------------------------------------
+            if output_path:
+
+                break
+
+            time.sleep(
+                1
+            )
+
+        if output_path is None:
+
+            raise RuntimeError(
+                "Generation completed but "
+                "no MP4 was found in:\n"
+                f"{OUTPUT_DIR}"
+            )
 
         print(
-            "Downloading generated video..."
-        )
-
-        output_path = download_video(
-            video
+            "\n" + "=" * 60
         )
 
         print(
-            f"Saved: {output_path}"
+            "VIDEO SAVED"
+        )
+
+        print(
+            output_path
+        )
+
+        print(
+            "=" * 60
         )
 
         return (
-            output_path,
-            f"Generation complete!\n\n"
-            f"Seed: {seed}\n"
-            f"Resolution: {width}x{height}\n"
-            f"FPS: {fps}\n"
-            f"Duration: {duration}s"
-        )
-
-    except requests.exceptions.ConnectionError:
-
-        raise gr.Error(
-            "Cannot connect to ComfyUI.\n\n"
-            "Make sure ComfyUI is running on:\n"
-            f"{COMFYUI_URL}"
+            str(output_path),
+            (
+                "✅ Generation complete\n\n"
+                f"Seed: {seed}\n"
+                f"Resolution: "
+                f"{width} × {height}\n"
+                f"Duration: {duration}s\n"
+                f"FPS: {fps}\n\n"
+                f"Saved:\n{output_path}"
+            )
         )
 
     except Exception as e:
 
-        print(
-            "\nERROR:"
-        )
-
-        print(
-            str(e)
-        )
+        traceback.print_exc()
 
         raise gr.Error(
             str(e)
@@ -928,16 +1174,16 @@ def generate_video(
 # ============================================================
 
 with gr.Blocks(
-    title="LTX-2.5 Video Generator"
+    title=APP_TITLE
 ) as app:
 
     gr.Markdown(
         """
 # 🎬 LTX-2.5 Video Generator
 
-Generate videos through your **ComfyUI LTX-2.5 workflow**.
+Direct LTX-2.5 ComfyUI node execution.
 
-**No LoRAs.**
+**No LoRAs • No ComfyUI server • No API**
 """
     )
 
@@ -950,9 +1196,9 @@ Generate videos through your **ComfyUI LTX-2.5 workflow**.
             prompt = gr.Textbox(
                 label="Positive Prompt",
                 placeholder=(
-                    "Describe the video you want..."
+                    "Describe the video..."
                 ),
-                lines=6
+                lines=7
             )
 
             negative_prompt = gr.Textbox(
@@ -970,7 +1216,7 @@ Generate videos through your **ComfyUI LTX-2.5 workflow**.
 
                 duration = gr.Number(
                     label="Duration (seconds)",
-                    value=DEFAULT_DURATION,
+                    value=5,
                     minimum=1,
                     maximum=60,
                     step=1
@@ -978,7 +1224,7 @@ Generate videos through your **ComfyUI LTX-2.5 workflow**.
 
                 fps = gr.Number(
                     label="FPS",
-                    value=DEFAULT_FPS,
+                    value=24,
                     minimum=1,
                     maximum=60,
                     step=1
@@ -988,16 +1234,16 @@ Generate videos through your **ComfyUI LTX-2.5 workflow**.
 
                 width = gr.Number(
                     label="Width",
-                    value=DEFAULT_WIDTH,
-                    minimum=64,
-                    step=64
+                    value=1280,
+                    minimum=32,
+                    step=32
                 )
 
                 height = gr.Number(
                     label="Height",
-                    value=DEFAULT_HEIGHT,
-                    minimum=64,
-                    step=64
+                    value=720,
+                    minimum=32,
+                    step=32
                 )
 
             seed = gr.Number(
@@ -1023,7 +1269,7 @@ Generate videos through your **ComfyUI LTX-2.5 workflow**.
 
             status = gr.Textbox(
                 label="Status",
-                lines=6
+                lines=8
             )
 
     generate_button.click(
@@ -1046,27 +1292,41 @@ Generate videos through your **ComfyUI LTX-2.5 workflow**.
 
 
 # ============================================================
-# START
+# START APP
 # ============================================================
 
 if __name__ == "__main__":
 
     print(
-        "\n=========================================="
-    )
-    print(
-        "       LTX-2.5 COMFYUI VIDEO APP"
-    )
-    print(
-        "=========================================="
+        "\n" + "=" * 60
     )
 
     print(
-        f"ComfyUI: {COMFYUI_URL}"
+        "        LTX-2.5 DIRECT NODE APP"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "ComfyUI API: DISABLED"
+    )
+
+    print(
+        "ComfyUI port 8188: NOT REQUIRED"
     )
 
     print(
         "LoRAs: DISABLED"
+    )
+
+    print(
+        f"Output: {OUTPUT_DIR}"
+    )
+
+    print(
+        "=" * 60
     )
 
     app.launch(
