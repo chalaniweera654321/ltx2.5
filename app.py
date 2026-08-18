@@ -29,7 +29,17 @@ print("=" * 60)
 UNETLoader = NODE_CLASS_MAPPINGS["UNETLoader"]()
 CLIPLoader = NODE_CLASS_MAPPINGS["CLIPLoader"]()
 VAELoader = NODE_CLASS_MAPPINGS["VAELoader"]()
-UpscaleModelLoader = NODE_CLASS_MAPPINGS["UpscaleModelLoader"]()
+
+# Fix for dynamic UpscaleModelLoader naming in ComfyUI
+UpscaleModelLoader = None
+for name, cls in NODE_CLASS_MAPPINGS.items():
+    if name == "UpscaleModelLoader" or name == "LatentUpscaleModelLoader":
+        UpscaleModelLoader = cls()
+        break
+
+if UpscaleModelLoader is None:
+    raise ValueError("Could not find UpscaleModelLoader in ComfyUI mappings")
+
 LoraLoader = NODE_CLASS_MAPPINGS["LoraLoader"]()
 
 # Conditioning & Latent
