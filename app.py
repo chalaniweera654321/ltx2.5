@@ -1,8 +1,3 @@
-Here is the fully converted Gradio application. It has been adapted to use the **LTX-2.5** video generation pipeline directly from your ComfyUI workflow. 
-
-The app now handles dual-stage latent sampling (low-res generation, upscaling, and high-res refinement), separate video/audio VAE decoding, and outputs a final video file with synchronized audio.
-
-```python
 import os
 import time
 import shutil
