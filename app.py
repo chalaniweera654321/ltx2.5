@@ -29,7 +29,7 @@ print("=" * 60)
 # dynamically — exactly the way ComfyUI itself executes a graph.
 # ============================================================
 
-_node_instances = {}
+
 import asyncio
 import nodes
 
@@ -38,7 +38,7 @@ import nodes
 # TextGenerateLTX2Prompt, etc.) is only registered by this call, which
 # main.py normally runs for you at ComfyUI startup.
 asyncio.run(nodes.init_extra_nodes())
-
+_node_instances = {}
 def get_node(node_type):
     """Instantiate (once) and cache a NODE_CLASS_MAPPINGS class."""
 
