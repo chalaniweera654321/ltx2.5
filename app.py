@@ -30,14 +30,30 @@ print("=" * 60)
 # ============================================================
 
 
+
 import asyncio
 import nodes
+import concurrent.futures
 
-# nodes.py only exposes the small "core" node set on import.
-# Everything in comfy_extras/ (LatentUpscaleModelLoader, LTXV* nodes,
-# TextGenerateLTX2Prompt, etc.) is only registered by this call, which
-# main.py normally runs for you at ComfyUI startup.
-asyncio.run(nodes.init_extra_nodes())
+def run_async(coro):
+    try:
+        asyncio.get_running_loop()
+        loop_is_running = True
+    except RuntimeError:
+        loop_is_running = False
+
+    if not loop_is_running:
+        return asyncio.run(coro)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(coro)).result()
+
+failed = run_async(nodes.init_extra_nodes(init_custom_nodes=True, init_api_nodes=False))
+
+if failed:
+    print("⚠️ Some nodes failed to load:", failed)
+
+
 _node_instances = {}
 def get_node(node_type):
     """Instantiate (once) and cache a NODE_CLASS_MAPPINGS class."""
