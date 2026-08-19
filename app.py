@@ -30,7 +30,14 @@ print("=" * 60)
 # ============================================================
 
 _node_instances = {}
+import asyncio
+import nodes
 
+# nodes.py only exposes the small "core" node set on import.
+# Everything in comfy_extras/ (LatentUpscaleModelLoader, LTXV* nodes,
+# TextGenerateLTX2Prompt, etc.) is only registered by this call, which
+# main.py normally runs for you at ComfyUI startup.
+asyncio.run(nodes.init_extra_nodes())
 
 def get_node(node_type):
     """Instantiate (once) and cache a NODE_CLASS_MAPPINGS class."""
